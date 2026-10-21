@@ -114,7 +114,10 @@ fn test_vault_withdrawal_enforces_min_amounts() {
 
     // Test 1: Withdrawal with min_amounts = 0 should succeed
     let (amount_a, amount_b) = vault_client.withdraw(&user, &shares, &0, &0);
-    assert!(amount_a > 0 || amount_b > 0, "Withdrawal should return tokens");
+    assert!(
+        amount_a > 0 || amount_b > 0,
+        "Withdrawal should return tokens"
+    );
 
     // Deposit again for further tests
     token_a_admin.mint(&user, &1000);
@@ -129,8 +132,14 @@ fn test_vault_withdrawal_enforces_min_amounts() {
 
     // Test 3: Withdrawal with reasonable min_amounts should succeed
     let (amount_a3, amount_b3) = vault_client.withdraw(&user, &shares2, &100, &100);
-    assert!(amount_a3 >= 100, "Withdrawal should meet min_amount_a requirement");
-    assert!(amount_b3 >= 100, "Withdrawal should meet min_amount_b requirement");
+    assert!(
+        amount_a3 >= 100,
+        "Withdrawal should meet min_amount_a requirement"
+    );
+    assert!(
+        amount_b3 >= 100,
+        "Withdrawal should meet min_amount_b requirement"
+    );
 }
 
 #[test]
@@ -202,11 +211,7 @@ fn test_router_slippage_calculation() {
 
     // Add a pool
     router_client.add_pool(
-        &admin,
-        &pool_id,
-        &token_a,
-        &token_b,
-        &30u32, // 0.3% fee
+        &admin, &pool_id, &token_a, &token_b, &30u32, // 0.3% fee
         false,
     );
 
@@ -259,14 +264,7 @@ fn test_router_slippage_execution() {
     router_client.initialize(&admin, &treasury, &xlm_token);
 
     // Add pool
-    router_client.add_pool(
-        &admin,
-        &pool_id,
-        &token_a,
-        &token_b,
-        &30u32,
-        false,
-    );
+    router_client.add_pool(&admin, &pool_id, &token_a, &token_b, &30u32, false);
     router_client
         .update_pool_reserves(&pool_id, &1000000, &1000000)
         .unwrap();
@@ -408,8 +406,14 @@ fn test_vault_uses_different_slippage_model() {
     // Vault withdrawal uses absolute min_amount_a and min_amount_b
     // These are not percentage-based, confirming the different model
     let (amount_a, amount_b) = vault_client.withdraw(&user, &shares, &100, &100);
-    assert!(amount_a >= 100, "Vault uses absolute minimum, not percentage");
-    assert!(amount_b >= 100, "Vault uses absolute minimum, not percentage");
+    assert!(
+        amount_a >= 100,
+        "Vault uses absolute minimum, not percentage"
+    );
+    assert!(
+        amount_b >= 100,
+        "Vault uses absolute minimum, not percentage"
+    );
 }
 
 // ==================== Edge Cases ====================
@@ -439,7 +443,10 @@ fn test_zero_slippage_allowed() {
 
     // 0% slippage should be accepted
     let quote = router_client.get_quote(&token_a, &token_b, &1000, Some(0));
-    assert_eq!(quote.minimum_output, 1000, "0% slippage should equal expected");
+    assert_eq!(
+        quote.minimum_output, 1000,
+        "0% slippage should equal expected"
+    );
 }
 
 #[test]
@@ -467,7 +474,10 @@ fn test_max_slippage_boundary() {
 
     // 100% slippage should be accepted
     let quote = router_client.get_quote(&token_a, &token_b, &1000, Some(10000));
-    assert_eq!(quote.minimum_output, 0, "100% slippage should result in 0 minimum");
+    assert_eq!(
+        quote.minimum_output, 0,
+        "100% slippage should result in 0 minimum"
+    );
 
     // 100.01% slippage should be rejected
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
