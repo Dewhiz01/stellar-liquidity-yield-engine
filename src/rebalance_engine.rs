@@ -101,6 +101,30 @@ pub struct ArbitrageThresholds {
 /// that successful publication.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebalancePacing {
+    /// Maximum amount (in the moved unit) that may leave one pool per window.
+    /// Zero disables pacing.
+    pub max_amount_per_window: i128,
+    /// Length of the pacing window, in seconds.
+    pub window_seconds: u64,
+}
+
+/// Consumption of the per-pool rebalance budget inside one window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolWindowUsage {
+    /// Whether a window has been opened for this pool at all. A boolean, rather
+    /// than a zero timestamp, so a window opened at ledger time 0 is distinct
+    /// from no window yet.
+    pub window_active: bool,
+    /// Ledger timestamp that opened the window.
+    pub window_started_at: u64,
+    /// Total amount moved out of the pool inside this window.
+    pub amount_moved: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolApyRecord {
     pub apy_bps: u32,        // Observed APY in basis points (10000 = 100%)
     pub updated_at: u64,     // Ledger timestamp the feed was refreshed
@@ -301,12 +325,23 @@ impl RebalanceEngine {
         // Verify caller is authorized (could be a vault or authorized manager)
         // For now, allow any caller - in production, add proper authorization
 
+        // Pace large moves out of a pool: an oversized or over-budget proposal is
+        // rejected before any token moves, so a mass unwind cannot execute in a
+        // single window. Only successful rebalances consume the budget.
+        let moved_amount = proposal.amount_a + proposal.amount_b;
+        if moved_amount > 0 && !Self::pacing_allows(&env, &proposal.from_pool, moved_amount) {
+            return false;
+        }
+
         let apy_before = Self::get_pool_current_apy(env.clone(), proposal.from_pool.clone());
         let mut success = false;
 
         // Execute the rebalance (simplified - would integrate with AMM contracts)
         if Self::perform_rebalance(&env, &proposal) {
             success = true;
+            if moved_amount > 0 {
+                Self::record_pacing(&env, &proposal.from_pool, moved_amount);
+            }
         }
 
         let apy_after = if success {
@@ -557,6 +592,120 @@ impl RebalanceEngine {
             .instance()
             .get(&Symbol::new(&env, "apy_keepers"))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ============ REBALANCE PACING (Issue #302) ============
+
+    /// Current rebalance pacing limits (zero when disabled).
+    pub fn get_rebalance_pacing(env: Env) -> RebalancePacing {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "rebalance_pacing"))
+            .unwrap_or(RebalancePacing {
+                max_amount_per_window: 0,
+                window_seconds: 0,
+            })
+    }
+
+    /// Set the per-pool rebalance budget (admin only).
+    ///
+    /// At most `max_amount_per_window` may leave one pool per window; a value of
+    /// zero disables pacing. Only successful rebalances consume the budget, so
+    /// a rejected or failed attempt does not lock the pool out for the window.
+    pub fn set_rebalance_pacing(
+        env: Env,
+        admin: Address,
+        max_amount_per_window: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_admin(&env, admin.clone());
+        require!(
+            max_amount_per_window >= 0,
+            "max_amount_per_window must not be negative"
+        );
+        require!(
+            max_amount_per_window == 0 || window_seconds > 0,
+            "window_seconds must be positive when pacing is enabled"
+        );
+
+        env.storage().instance().set(
+            &Symbol::new(&env, "rebalance_pacing"),
+            &RebalancePacing {
+                max_amount_per_window,
+                window_seconds,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rebalance_pacing_updated"),),
+            (admin, max_amount_per_window, window_seconds),
+        );
+    }
+
+    /// Amount already moved out of `pool_id` in the current pacing window.
+    pub fn get_pool_window_usage(env: Env, pool_id: Address) -> PoolWindowUsage {
+        Self::get_pool_windows(env.clone())
+            .get(pool_id)
+            .unwrap_or(PoolWindowUsage {
+                window_active: false,
+                window_started_at: 0,
+                amount_moved: 0,
+            })
+    }
+
+    /// Internal: the per-pool pacing windows.
+    fn get_pool_windows(env: Env) -> Map<Address, PoolWindowUsage> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "rebalance_pool_windows"))
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Internal: whether `amount` may leave `pool_id` under the current window.
+    fn pacing_allows(env: &Env, pool_id: &Address, amount: i128) -> bool {
+        let pacing = Self::get_rebalance_pacing(env.clone());
+        if pacing.max_amount_per_window <= 0 || pacing.window_seconds == 0 {
+            return true;
+        }
+
+        let usage = Self::get_pool_window_usage(env.clone(), pool_id.clone());
+        let now = env.ledger().timestamp();
+        let used = if usage.window_active
+            && now.saturating_sub(usage.window_started_at) < pacing.window_seconds
+        {
+            usage.amount_moved
+        } else {
+            0
+        };
+
+        used + amount <= pacing.max_amount_per_window
+    }
+
+    /// Internal: charge a successful move against the pool's window.
+    fn record_pacing(env: &Env, pool_id: &Address, amount: i128) {
+        let pacing = Self::get_rebalance_pacing(env.clone());
+        if pacing.max_amount_per_window <= 0 || pacing.window_seconds == 0 {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+        let mut usage = Self::get_pool_window_usage(env.clone(), pool_id.clone());
+        if !usage.window_active
+            || now.saturating_sub(usage.window_started_at) >= pacing.window_seconds
+        {
+            usage = PoolWindowUsage {
+                window_active: true,
+                window_started_at: now,
+                amount_moved: 0,
+            };
+        }
+        usage.amount_moved += amount;
+
+        let mut windows = Self::get_pool_windows(env.clone());
+        windows.set(pool_id.clone(), usage);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "rebalance_pool_windows"), &windows);
     }
 
     /// Calculate impermanent loss for a pool using the standard formula
@@ -1013,6 +1162,13 @@ impl RebalanceEngine {
             .get_vault_info()
             .pool_id;
 
+        // Pace the exit leg: the amount withdrawn from the pool is `amount` of
+        // each token, i.e. `2 * amount` moved out of this pool.
+        let moved_amount = amount * 2;
+        if moved_amount > 0 && !Self::pacing_allows(&env, &current_pool, moved_amount) {
+            return false;
+        }
+
         // 1. Withdraw from current pool (atomic operation 1)
         let withdrawn = Self::perform_rebalance(
             &env,
@@ -1035,7 +1191,7 @@ impl RebalanceEngine {
         let deposited = Self::perform_rebalance(
             &env,
             &RebalanceProposal {
-                from_pool: current_pool,
+                from_pool: current_pool.clone(),
                 to_pool: opportunity.pool_id,
                 amount_a: amount,
                 amount_b: amount,
@@ -1047,6 +1203,9 @@ impl RebalanceEngine {
 
         if deposited {
             // Update this vault's cooldown only; other vaults stay free to rebalance.
+            if moved_amount > 0 {
+                Self::record_pacing(&env, &current_pool, moved_amount);
+            }
             Self::record_vault_rebalance(&env, vault_id);
         }
 
@@ -1112,7 +1271,7 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
-    use soroban_sdk::{Env, Symbol, Vec};
+    use soroban_sdk::{token::StellarAssetClient, Env, Symbol, Vec};
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         let pool = Address::generate(env);
@@ -1489,6 +1648,31 @@ mod tests {
         assert!(opportunity.recommended);
     }
 
+    // ============ REBALANCE PACING TESTS (Issue #302) ============
+
+    /// Real token contracts for a rebalance leg: the engine pulls the `from`
+    /// leg out of the source pool and pays the `to` leg from its own balance.
+    fn funded_pools(env: &Env, engine_id: &Address, amount: i128) -> (Address, Address) {
+        let admin = Address::generate(env);
+        let from = env.register_stellar_asset_contract_v2(admin.clone());
+        let to = env.register_stellar_asset_contract_v2(admin);
+        StellarAssetClient::new(env, &from.address()).mint(&from.address(), &amount);
+        StellarAssetClient::new(env, &to.address()).mint(engine_id, &amount);
+        (from.address(), to.address())
+    }
+
+    fn pacing_proposal(from_pool: &Address, to_pool: &Address, amount: i128) -> RebalanceProposal {
+        RebalanceProposal {
+            from_pool: from_pool.clone(),
+            to_pool: to_pool.clone(),
+            amount_a: amount,
+            amount_b: amount,
+            expected_apy_improvement: 0,
+            estimated_gas_cost: 0,
+            timestamp: 0,
+        }
+    }
+
     // ============ CIRCUIT BREAKER TESTS (Issue #303) ============
 
     /// The breaker rule is a pure function: no engine, no storage, no ledger.
@@ -1516,6 +1700,86 @@ mod tests {
             estimated_gas_cost: 0,
             timestamp: env.ledger().timestamp(),
         }
+    }
+
+    #[test]
+    fn test_rebalance_pacing_is_disabled_by_default() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+
+        let pacing = client.get_rebalance_pacing();
+        assert_eq!(pacing.max_amount_per_window, 0);
+        assert_eq!(pacing.window_seconds, 0);
+
+        let usage = client.get_pool_window_usage(&Address::generate(&env));
+        assert!(!usage.window_active);
+        assert_eq!(usage.amount_moved, 0);
+    }
+
+    #[test]
+    fn test_rebalance_pacing_bounds_moves_and_resets_per_window() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(RebalanceEngine, ());
+        let client = RebalanceEngineClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
+        let caller = Address::generate(&env);
+        client.set_rebalance_pacing(&admin, &500, &3_600);
+
+        // A single move larger than the whole window budget is rejected before
+        // any tokens move, and does not open a window.
+        let oversized = pacing_proposal(&from_pool, &to_pool, 300); // 600 moved
+        assert!(!client.execute_rebalance(&caller, &oversized));
+        assert!(!client.get_pool_window_usage(&from_pool).window_active);
+
+        // 400 moved fits the 500 budget and is recorded.
+        let allowed = pacing_proposal(&from_pool, &to_pool, 200);
+        assert!(client.execute_rebalance(&caller, &allowed));
+        assert_eq!(client.get_pool_window_usage(&from_pool).amount_moved, 400);
+
+        // The remaining 100 of budget cannot absorb another 400.
+        assert!(!client.execute_rebalance(&caller, &allowed));
+        assert_eq!(client.get_pool_window_usage(&from_pool).amount_moved, 400);
+
+        // Once the window has elapsed the budget resets.
+        env.ledger().set_timestamp(3_600);
+        assert!(client.execute_rebalance(&caller, &allowed));
+        assert_eq!(client.get_pool_window_usage(&from_pool).amount_moved, 400);
+    }
+
+    #[test]
+    fn test_set_rebalance_pacing_is_admin_only() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_rebalance_pacing(&stranger, &100, &3_600);
+        }));
+
+        assert!(result.is_err(), "pacing limits must be admin only");
+        assert_eq!(client.get_rebalance_pacing().max_amount_per_window, 0);
+    }
+
+    #[test]
+    fn test_set_rebalance_pacing_validates_limits() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+
+        // A negative budget is not meaningful.
+        let negative = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_rebalance_pacing(&admin, &-1, &3_600);
+        }));
+        assert!(negative.is_err());
+
+        // An enabled budget needs a window to apply over.
+        let no_window = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_rebalance_pacing(&admin, &100, &0);
+        }));
+        assert!(no_window.is_err());
     }
 
     #[test]

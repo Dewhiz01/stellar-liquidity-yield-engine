@@ -192,9 +192,10 @@ impl MultiRewardDistributor {
             .set(&Symbol::new(&env, "emergency_mode"), &false);
 
         // Initialize default slippage (aligned with swap_router for consistency)
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "default_slippage"), &DEFAULT_MAX_SLIPPAGE_BPS);
+        env.storage().instance().set(
+            &Symbol::new(&env, "default_slippage"),
+            &DEFAULT_MAX_SLIPPAGE_BPS,
+        );
 
         // Initialize empty reward streams
         let streams: Vec<RewardStream> = Vec::new(&env);
@@ -471,7 +472,7 @@ impl MultiRewardDistributor {
             }
 
             // Calculate treasury fee (0.25%)
-            let treasury_fee = (pending * TREASURY_FEE_BPS as i128) / BASIS_POINTS_DIVISOR;
+            let treasury_fee = (pending * TREASURY_FEE_BPS as i128) / BPS_DIVISOR;
             let net_reward = pending - treasury_fee;
 
             // Transfer net reward to user
@@ -598,7 +599,7 @@ impl MultiRewardDistributor {
         reinvest_percentage: u32,
         enabled: bool,
     ) {
-        if reinvest_percentage > BASIS_POINTS_DIVISOR as u32 {
+        if reinvest_percentage > BPS_DIVISOR as u32 {
             panic_with_error!(&env, RewardError::InvalidPercentage);
         }
 
@@ -652,7 +653,7 @@ impl MultiRewardDistributor {
                 continue;
             }
 
-            let to_reinvest = (pending * config.reinvest_percentage as i128) / BASIS_POINTS_DIVISOR;
+            let to_reinvest = (pending * config.reinvest_percentage as i128) / BPS_DIVISOR;
             let to_claim = pending - to_reinvest;
 
             if to_reinvest > 0 {
@@ -857,8 +858,11 @@ impl MultiRewardDistributor {
     /// Update default slippage (admin only)
     /// Aligned with swap_router::update_default_slippage for consistency
     pub fn update_default_slippage(env: Env, admin: Address, new_slippage_bps: u32) {
-        Self::require_admin(&env, admin);
-        require!(new_slippage_bps <= BPS_DIVISOR as u32, RewardError::InvalidPercentage);
+        Self::require_admin(&env, admin.clone());
+        require!(
+            new_slippage_bps <= BPS_DIVISOR as u32,
+            RewardError::InvalidPercentage
+        );
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "default_slippage"), &new_slippage_bps);
@@ -1105,7 +1109,7 @@ impl MultiRewardDistributor {
     ) -> i128 {
         // In production, query DEX for expected output
         // Apply slippage protection
-        let slippage_factor = (BPS_DIVISOR - max_slippage_bps as i128) as i128;
+        let slippage_factor = BPS_DIVISOR - max_slippage_bps as i128;
         amount * slippage_factor / BPS_DIVISOR
     }
 

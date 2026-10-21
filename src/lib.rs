@@ -42,12 +42,8 @@ mod rebalance_engine;
 mod reward_distributor;
 #[cfg(feature = "strategy-registry")]
 mod strategy_registry;
-#[cfg(feature = "il-insurance")]
-mod il_insurance;
-#[cfg(feature = "actuary")]
-mod actuary;
-#[cfg(feature = "oracle-registry")]
-mod oracle_registry;
+#[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
+mod yield_vault;
 
 #[cfg(feature = "actuary")]
 pub use actuary::*;
@@ -59,12 +55,8 @@ pub use rebalance_engine::*;
 pub use reward_distributor::*;
 #[cfg(feature = "strategy-registry")]
 pub use strategy_registry::*;
-#[cfg(feature = "il-insurance")]
-pub use il_insurance::*;
-#[cfg(feature = "actuary")]
-pub use actuary::*;
-#[cfg(feature = "oracle-registry")]
-pub use oracle_registry::*;
+#[cfg(feature = "yield-vault")]
+pub use yield_vault::*;
 
 #[cfg(feature = "engine")]
 #[contract]
@@ -209,22 +201,13 @@ impl StellarLiquidityYieldEngine {
     }
 
     /// Panic unless the contract is unpaused.
-    ///
-    /// Safety checklist item P-1: every state-mutating entrypoint that is not
-    /// itself an emergency control (pause/unpause/upgrade/migrate) must call
-    /// this guard before touching storage. Verified by
-    /// `test_paused_blocks_state_mutations`.
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
             panic!("contract is paused");
         }
     }
 
-    /// Require admin authorization.
-    ///
-    /// Safety checklist item A-1: privileged entrypoints must compare the
-    /// caller against the stored admin and panic otherwise. Verified by
-    /// `test_non_admin_cannot_pause` and `test_non_admin_cannot_update_admin`.
+    /// Require admin authorization
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
