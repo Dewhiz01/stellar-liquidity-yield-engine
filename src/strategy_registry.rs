@@ -688,8 +688,8 @@ mod tests {
 
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Env, Symbol, Vec};
     use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
 
     fn fee_structure() -> FeeStructure {
         FeeStructure {
@@ -1166,6 +1166,16 @@ mod tests {
         assert!(client.is_paused_view());
     }
 
+    /// Topic of the only event published by the most recent invocation.
+    ///
+    /// `env.events().all()` only exposes the events of the latest contract
+    /// call, so each event has to be inspected before the next call is made.
+    fn last_event_topic(env: &Env) -> Symbol {
+        let events = env.events().all();
+        let (_contract, topics, _data) = events.last().unwrap();
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap()
+    }
+
     #[test]
     fn test_pause_emits_audit_events() {
         let env = Env::default();
@@ -1173,23 +1183,18 @@ mod tests {
         let (admin, _creator, client) = setup(&env);
 
         client.pause(&admin);
-        client.unpause(&admin);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "registry_paused"),
+            "pause must emit registry_paused event"
+        );
 
-        let events = env.events().all();
-        let mut saw_pause = false;
-        let mut saw_unpause = false;
-        for (topics, _data) in events.iter() {
-            let first = topics.get(0).unwrap();
-            let sym: Symbol = first.try_into().unwrap();
-            if sym == Symbol::new(&env, "registry_paused") {
-                saw_pause = true;
-            }
-            if sym == Symbol::new(&env, "registry_unpaused") {
-                saw_unpause = true;
-            }
-        }
-        assert!(saw_pause, "pause must emit registry_paused event");
-        assert!(saw_unpause, "unpause must emit registry_unpaused event");
+        client.unpause(&admin);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "registry_unpaused"),
+            "unpause must emit registry_unpaused event"
+        );
     }
 
     #[test]
