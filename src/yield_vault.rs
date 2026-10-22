@@ -720,7 +720,7 @@ impl YieldVault {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "treasury"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| panic!("treasury not configured"))
     }
 
     /// Queue a change to the treasury/DAO address that receives protocol fees
@@ -1087,7 +1087,7 @@ impl YieldVault {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     /// Check if vault is paused
