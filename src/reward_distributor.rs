@@ -975,14 +975,14 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     fn get_treasury(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "treasury"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("treasury not configured"))
     }
 
     fn get_swap_router(env: Env) -> Address {
