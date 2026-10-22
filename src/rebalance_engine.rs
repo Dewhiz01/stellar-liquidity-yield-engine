@@ -1140,7 +1140,7 @@ impl RebalanceEngine {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     fn require_admin(env: &Env, caller: Address) {
