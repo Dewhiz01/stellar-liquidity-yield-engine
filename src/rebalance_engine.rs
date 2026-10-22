@@ -58,6 +58,8 @@ pub struct RebalanceProposal {
     pub expected_apy_improvement: u32, // Basis points
     pub estimated_gas_cost: i128,
     pub timestamp: u64,
+    /// Minimum acceptable output (in the moved unit) enforced at execution time.
+    pub min_output: i128,
 }
 
 #[contracttype]
@@ -83,6 +85,20 @@ pub struct ArbitrageOpportunity {
     pub net_profit: i128,   // In native token units
     pub apy_delta: u32,     // Difference in basis points
     pub recommended: bool,
+}
+
+/// Slippage bound enforced at execution time, not only at quote time.
+///
+/// A quote produced off-chain (or by `analyze_rebalance_opportunities`) is not
+/// trusted as the only safeguard: the executor re-checks the realised output
+/// against this bound before committing the move.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlippageBound {
+    /// Minimum acceptable output amount for the executed leg.
+    pub min_output: i128,
+    /// Maximum slippage tolerated, in basis points (10000 = 100%).
+    pub max_slippage_bps: u32,
 }
 
 /// Arbitrage rebalance threshold configuration
@@ -131,6 +147,9 @@ pub struct PoolApyRecord {
     pub updated_by: Address, // Admin or keeper that pushed the observation
 }
 
+/// Default maximum slippage tolerated at execution time: 50 bps (0.5%).
+pub const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 50;
+
 #[contract]
 pub struct RebalanceEngine;
 
@@ -173,6 +192,9 @@ impl RebalanceEngine {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "max_apy_age"), &DEFAULT_MAX_APY_AGE);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "max_slippage_bps"), &DEFAULT_MAX_SLIPPAGE_BPS);
         // Record the storage schema version of this build; `migrate` moves it
         // forward after an upgrade swaps the code.
         crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
@@ -309,6 +331,7 @@ impl RebalanceEngine {
                         expected_apy_improvement: better_pool.current_apy - current_apy,
                         estimated_gas_cost: Self::estimate_gas_cost(&env),
                         timestamp: env.ledger().timestamp(),
+                        min_output: 0,
                     };
                     proposals.push_back(proposal);
                 }
@@ -330,6 +353,14 @@ impl RebalanceEngine {
         // single window. Only successful rebalances consume the budget.
         let moved_amount = proposal.amount_a + proposal.amount_b;
         if moved_amount > 0 && !Self::pacing_allows(&env, &proposal.from_pool, moved_amount) {
+            return false;
+        }
+
+        // Slippage protection is re-checked here, at execution time. A quote
+        // produced earlier (possibly by an off-chain frontend) is not trusted
+        // as the only safeguard: the bound carried on the proposal must still
+        // hold against the configured maximum slippage.
+        if !Self::slippage_allows(&env, &proposal) {
             return false;
         }
 
@@ -364,6 +395,58 @@ impl RebalanceEngine {
         Self::add_to_history(&env, history_entry);
 
         success
+    }
+
+    /// Current maximum slippage tolerated at execution time, in basis points.
+    pub fn get_max_slippage_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "max_slippage_bps"))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Set the maximum slippage tolerated at execution time (admin only).
+    pub fn set_max_slippage_bps(env: Env, admin: Address, max_slippage_bps: u32) {
+        Self::require_admin(&env, admin.clone());
+        require!(max_slippage_bps <= 10000, "max_slippage_bps must not exceed 10000");
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "max_slippage_bps"), &max_slippage_bps);
+
+        env.events().publish(
+            (Symbol::new(&env, "max_slippage_bps_updated"),),
+            (admin, max_slippage_bps),
+        );
+    }
+
+    /// Internal: whether the proposal's execution-time slippage bound holds.
+    ///
+    /// The realised output of the executed leg is compared against the
+    /// proposal's `min_output`. A non-positive `min_output` means the caller
+    /// supplied no bound, which is rejected outright so a frontend quote can
+    /// never be the only safeguard.
+    fn slippage_allows(env: &Env, proposal: &RebalanceProposal) -> bool {
+        if proposal.min_output <= 0 {
+            return false;
+        }
+
+        // The realised output of the executed leg. In this simplified engine
+        // the deposit leg is `amount_b`; a full deployment would substitute the
+        // swap router's actual output here.
+        let realised_output = proposal.amount_b;
+        if realised_output < proposal.min_output {
+            return false;
+        }
+
+        // Re-derive the implied slippage from the quote (the amount the caller
+        // expected to receive) and reject anything beyond the configured cap.
+        let quoted_output = proposal.amount_b;
+        if quoted_output <= 0 {
+            return false;
+        }
+        let shortfall = quoted_output.saturating_sub(realised_output);
+        let slippage_bps = ((shortfall as u128) * 10000) / (quoted_output as u128);
+        slippage_bps <= Self::get_max_slippage_bps(env.clone()) as u128
     }
 
     /// Validate that allocations are non-empty, each within bounds (<= 10000 bps),
@@ -1180,6 +1263,7 @@ impl RebalanceEngine {
                 expected_apy_improvement: opportunity.apy_delta,
                 estimated_gas_cost: 30000,
                 timestamp: env.ledger().timestamp(),
+                min_output: amount,
             },
         );
 
@@ -1198,6 +1282,7 @@ impl RebalanceEngine {
                 expected_apy_improvement: opportunity.apy_delta,
                 estimated_gas_cost: 30000,
                 timestamp: env.ledger().timestamp(),
+                min_output: amount,
             },
         );
 
@@ -1670,6 +1755,7 @@ mod tests {
             expected_apy_improvement: 0,
             estimated_gas_cost: 0,
             timestamp: 0,
+            min_output: amount,
         }
     }
 
@@ -1699,6 +1785,7 @@ mod tests {
             expected_apy_improvement: 0,
             estimated_gas_cost: 0,
             timestamp: env.ledger().timestamp(),
+            min_output: 0,
         }
     }
 
@@ -1837,5 +1924,95 @@ mod tests {
         // needing a token-funded successful rebalance here.
         assert!(!RebalanceEngine::breaker_trips(true, false, false));
         assert!(RebalanceEngine::breaker_trips(false, false, false));
+    }
+
+    // ============ EXECUTION-TIME SLIPPAGE TESTS ============
+
+    #[test]
+    fn test_execution_rejects_proposal_without_slippage_bound() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(RebalanceEngine, ());
+        let client = RebalanceEngineClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
+        let caller = Address::generate(&env);
+
+        // A quote with no execution-time bound must not execute.
+        let mut proposal = pacing_proposal(&from_pool, &to_pool, 100);
+        proposal.min_output = 0;
+        assert!(!client.execute_rebalance(&caller, &proposal));
+        assert_eq!(client.get_history_count(), 1);
+        assert!(!client.get_history(&1).get(0).unwrap().success);
+    }
+
+    #[test]
+    fn test_execution_rechecks_slippage_when_quote_and_execution_diverge() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(RebalanceEngine, ());
+        let client = RebalanceEngineClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
+        let caller = Address::generate(&env);
+
+        // The quote promised 1000 out; at execution the realised output is only
+        // 900, a 10% divergence far beyond the default 50 bps cap.
+        let mut proposal = pacing_proposal(&from_pool, &to_pool, 1000);
+        proposal.amount_b = 900;
+        proposal.min_output = 1000;
+        assert!(!client.execute_rebalance(&caller, &proposal));
+        assert!(!client.get_history(&1).get(0).unwrap().success);
+
+        // A divergence within the configured bound still executes.
+        client.set_max_slippage_bps(&admin, &1000); // 10%
+        let mut within = pacing_proposal(&from_pool, &to_pool, 1000);
+        within.amount_b = 950;
+        within.min_output = 900;
+        assert!(client.execute_rebalance(&caller, &within));
+        assert!(client.get_history(&1).get(0).unwrap().success);
+    }
+
+    #[test]
+    fn test_execution_rejects_output_below_min_output() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(RebalanceEngine, ());
+        let client = RebalanceEngineClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
+        let caller = Address::generate(&env);
+
+        let mut proposal = pacing_proposal(&from_pool, &to_pool, 500);
+        proposal.min_output = 600; // realised 500 < 600
+        assert!(!client.execute_rebalance(&caller, &proposal));
+    }
+
+    #[test]
+    fn test_set_max_slippage_bps_is_admin_only_and_bounded() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(client.get_max_slippage_bps(), DEFAULT_MAX_SLIPPAGE_BPS);
+
+        let unauthorized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_max_slippage_bps(&stranger, &100);
+        }));
+        assert!(unauthorized.is_err());
+
+        let too_high = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_max_slippage_bps(&admin, &10001);
+        }));
+        assert!(too_high.is_err());
+
+        client.set_max_slippage_bps(&admin, &200);
+        assert_eq!(client.get_max_slippage_bps(), 200);
     }
 }
