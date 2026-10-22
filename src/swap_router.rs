@@ -682,14 +682,14 @@ impl SwapRouter {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     fn get_treasury(env: &Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(env, "treasury"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("treasury not configured"))
     }
 
     fn get_xlm_token(env: &Env) -> Address {
@@ -1323,6 +1323,55 @@ mod tests {
             SwapRouter::unpause_oracle(env.clone(), non_admin.clone());
         }));
         assert!(result.is_err());
+    }
+
+    fn assert_panic_contains<F>(f: F, expected: &str)
+    where
+        F: FnOnce() + std::panic::UnwindSafe,
+    {
+        let payload = std::panic::catch_unwind(f).expect_err("expected panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains(expected),
+            "panic message did not contain {:?}: {:?}",
+            expected,
+            message
+        );
+    }
+
+    #[test]
+    fn test_uninitialized_admin_and_treasury_are_rejected_with_clear_errors() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let input_token = Address::generate(&env);
+        let output_token = Address::generate(&env);
+        let path = Vec::from_array(&env, [input_token.clone(), output_token.clone()]);
+
+        assert_panic_contains(
+            || SwapRouter::pause_oracle(env.clone(), admin.clone()),
+            "admin not configured",
+        );
+
+        assert_panic_contains(
+            || {
+                SwapRouter::swap(
+                    env.clone(),
+                    user,
+                    input_token,
+                    output_token,
+                    1_000,
+                    900,
+                    path,
+                    None,
+                );
+            },
+            "treasury not configured",
+        );
     }
 
     #[test]
