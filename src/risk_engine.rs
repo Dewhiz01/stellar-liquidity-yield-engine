@@ -118,6 +118,17 @@ impl RiskEngine {
         adjustment
     }
 
+    /// Minimum number of recent results required before the failure-rate check
+    /// can trip the breaker. Below this, a sample is too small to be meaningful.
+    const FAILURE_RATE_MIN_SAMPLE: u32 = 3;
+    /// How many of the most recent rebalances are considered when computing
+    /// the recent failure rate (uses fewer if history is shorter than this).
+    const FAILURE_RATE_WINDOW: u32 = 5;
+    /// Trip the breaker once the recent failure rate reaches this many basis
+    /// points (6000 = 60%). Chosen so 3-for-3 (100%) still trips, same as the
+    /// previous "3 in a row" rule, but so does e.g. 3-for-5 (60%).
+    const FAILURE_RATE_THRESHOLD_BP: u32 = 6000;
+
     /// Circuit breaker: pause rebalancing if conditions are critical
     pub fn circuit_breaker_check(
         env: Env,
@@ -137,13 +148,24 @@ impl RiskEngine {
             return true;
         }
 
-        // 3. Last 3 rebalances were all losses
-        if recent_losses.len() >= 3 {
-            let last_three_loss = recent_losses.get(recent_losses.len() - 3).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 2).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 1).unwrap_or(false);
-            
-            if last_three_loss {
+        // 3. Recent failure rate is high. Aggregating over a window catches
+        // patterns a strict "last 3 in a row" check misses — e.g. a loss on
+        // 4 of the last 5 rebalances (80% failure rate) with a single win
+        // breaking up the streak never used to trip this breaker at all.
+        let total = recent_losses.len();
+        if total >= Self::FAILURE_RATE_MIN_SAMPLE {
+            let window = Self::FAILURE_RATE_WINDOW.min(total);
+            let start = total - window;
+
+            let mut failures: u32 = 0;
+            for i in start..total {
+                if recent_losses.get(i).unwrap_or(false) {
+                    failures += 1;
+                }
+            }
+
+            let failure_rate_bp = (failures * 10000) / window;
+            if failure_rate_bp >= Self::FAILURE_RATE_THRESHOLD_BP {
                 return true;
             }
         }
@@ -208,10 +230,19 @@ impl RiskEngine {
 mod tests {
     extern crate std;
     use super::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         RiskEngine::calculate_impermanent_loss(env.clone(), current, entry)
+    }
+
+    fn make_losses(env: &Env, pattern: &[bool]) -> Vec<bool> {
+        let mut v = Vec::new(env);
+        for &p in pattern {
+            v.push_back(p);
+        }
+        v
     }
 
     #[test]
@@ -257,5 +288,74 @@ mod tests {
         let il_small = il(&env, 11000, 10000); // r=1.1
         let il_large = il(&env, 20000, 10000); // r=2
         assert!(il_large > il_small, "IL should increase with price divergence");
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_on_gas_surge() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        let losses = make_losses(&env, &[]);
+        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, true, 0, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_on_pool_imbalance() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        let losses = make_losses(&env, &[]);
+        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 81, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_on_three_consecutive_losses() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        // Same pattern the old "3 in a row" rule caught; the new rate-based
+        // rule still catches it, since 3-for-3 is a 100% failure rate.
+        let losses = make_losses(&env, &[false, true, true, true]);
+        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_on_high_failure_rate_without_three_in_a_row() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        // 4 of the last 5 failed, but never 3 losses in a row: the old logic
+        // would have missed this entirely. New logic: 4/5 = 80% >= 60% trips.
+        let losses = make_losses(&env, &[true, true, false, true, true]);
+        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_does_not_trip_on_low_failure_rate() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        // 2 of the last 5 failed (40%), below the 60% threshold.
+        let losses = make_losses(&env, &[true, false, false, true, false]);
+        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_requires_minimum_sample_size() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        // Only 2 data points, both losses. Sample is too small (below
+        // FAILURE_RATE_MIN_SAMPLE) to be meaningful, so it must not trip.
+        let losses = make_losses(&env, &[true, true]);
+        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_window_looks_at_most_recent_results() {
+        let env = Env::default();
+        let pool_id = Address::generate(&env);
+        // 10 results: first 5 are all losses (old history), last 5 are all
+        // wins (recent, healthy). The window (last 5) should see 0% failure
+        // and must not trip, even though the full history is 50% losses.
+        let losses = make_losses(
+            &env,
+            &[true, true, true, true, true, false, false, false, false, false],
+        );
+        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
     }
 }

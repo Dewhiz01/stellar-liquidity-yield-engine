@@ -143,7 +143,7 @@ impl StellarLiquidityYieldEngine {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     /// Update admin
