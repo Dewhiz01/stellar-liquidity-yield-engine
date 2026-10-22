@@ -21,6 +21,10 @@ pub const MAX_APY_BPS: u32 = 1_000_000;
 /// Default age after which an APY observation is considered stale: 24 hours.
 pub const DEFAULT_MAX_APY_AGE: u64 = 86_400;
 
+/// Default number of rejected observations that excludes a pool from routing
+/// until its feed is accepted again (Issue #289).
+pub const DEFAULT_FEED_FAILURE_THRESHOLD: u32 = 3;
+
 /// Number of consecutive failed rebalances that trips the circuit breaker.
 pub const EMERGENCY_STOP_WINDOW: u32 = 3;
 
@@ -92,6 +96,28 @@ pub struct ArbitrageThresholds {
     pub min_apy_delta: u32, // Minimum APY difference to trigger rebalance (basis points)
     pub max_il_tolerance: u32, // Maximum acceptable IL (basis points)
     pub cooldown_period: u64, // Seconds between rebalances, applied per vault
+    /// Minimum estimated net profit for an opportunity to be routed, in the
+    /// same units as [`ArbitrageOpportunity::net_profit`] (Issue #294).
+    /// `0` disables the filter.
+    pub min_net_profit: i128,
+}
+
+/// Validation-failure tracking for one pool's oracle feed (Issue #289).
+///
+/// A feed whose last observation failed validation must not influence routing.
+/// The off-chain validator calls [`RebalanceEngine::record_feed_validation_failure`]
+/// each time it rejects an observation; once `failure_count` reaches the
+/// configured exclusion threshold the feed is marked `excluded` and every
+/// routing path skips the pool until a valid observation is accepted again.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedValidationRecord {
+    /// Rejected observations counted since the feed was last accepted.
+    pub failure_count: u32,
+    /// Ledger timestamp of the most recent rejected observation.
+    pub last_failure_at: u64,
+    /// True once `failure_count` reached the exclusion threshold.
+    pub excluded: bool,
 }
 
 /// One oracle observation for a pool.
@@ -129,6 +155,24 @@ pub struct PoolApyRecord {
     pub apy_bps: u32,        // Observed APY in basis points (10000 = 100%)
     pub updated_at: u64,     // Ledger timestamp the feed was refreshed
     pub updated_by: Address, // Admin or keeper that pushed the observation
+}
+
+/// Staleness snapshot for one pool's oracle feed (Issue #293).
+///
+/// Gives off-chain monitors a direct data-age signal instead of making them
+/// reconstruct it from `updated_at` and the current ledger time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedDataAge {
+    /// Ledger timestamp of the most recent observation, or 0 when unpublished.
+    pub updated_at: u64,
+    /// Seconds elapsed since that observation (saturating; 0 when unpublished).
+    pub age_seconds: u64,
+    /// Age at or after which the observation is considered stale.
+    pub max_age_seconds: u64,
+    /// True when the feed has an observation and `age_seconds` is within the
+    /// configured maximum age. False when unpublished or stale.
+    pub fresh: bool,
 }
 
 #[contract]
@@ -173,6 +217,15 @@ impl RebalanceEngine {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "max_apy_age"), &DEFAULT_MAX_APY_AGE);
+        // Issue #289: feed validation-failure tracking, keyed by pool.
+        let feed_validation: Map<Address, FeedValidationRecord> = Map::new(&env);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &feed_validation);
+        env.storage().instance().set(
+            &Symbol::new(&env, "feed_failure_threshold"),
+            &DEFAULT_FEED_FAILURE_THRESHOLD,
+        );
         // Record the storage schema version of this build; `migrate` moves it
         // forward after an upgrade swaps the code.
         crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
@@ -505,22 +558,37 @@ impl RebalanceEngine {
         // method argument.
         caller.require_auth();
 
+        let mut registry = Self::get_apy_registry(env.clone());
+        let previous = registry.get(pool_id.clone());
+
         let record = PoolApyRecord {
             apy_bps,
             updated_at: env.ledger().timestamp(),
             updated_by: caller.clone(),
         };
 
-        let mut registry = Self::get_apy_registry(env.clone());
+        // A re-published observation still refreshes freshness: a feeder that
+        // keeps reporting a stable rate is not stuck. Issue #295 only adds a
+        // marker so an operator can tell a genuine change from a no-op.
         registry.set(pool_id.clone(), record);
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "pool_apy"), &registry);
 
-        env.events().publish(
-            (Symbol::new(&env, "pool_apy_updated"), pool_id),
-            (caller, apy_bps),
-        );
+        match previous {
+            Some(prev) if prev.apy_bps == apy_bps => {
+                env.events().publish(
+                    (Symbol::new(&env, "pool_apy_unchanged"), pool_id),
+                    (caller, apy_bps, prev.updated_at),
+                );
+            }
+            _ => {
+                env.events().publish(
+                    (Symbol::new(&env, "pool_apy_updated"), pool_id),
+                    (caller, apy_bps),
+                );
+            }
+        }
     }
 
     /// Current APY of a pool from the oracle registry, in basis points.
@@ -572,6 +640,58 @@ impl RebalanceEngine {
         }
     }
 
+    /// Data-age snapshot for a pool's oracle feed (Issue #293).
+    ///
+    /// An unpublished feed reports `age_seconds == 0` and `fresh == false`, so
+    /// a monitor cannot mistake "no data" for "brand new data"; the `fresh`
+    /// flag is the authoritative signal in both cases.
+    pub fn get_feed_data_age(env: Env, pool_id: Address) -> FeedDataAge {
+        let max_age_seconds = Self::get_max_apy_age(env.clone());
+        match Self::get_apy_registry(env.clone()).get(pool_id) {
+            Some(record) => {
+                let age_seconds = env.ledger().timestamp().saturating_sub(record.updated_at);
+                FeedDataAge {
+                    updated_at: record.updated_at,
+                    age_seconds,
+                    max_age_seconds,
+                    fresh: age_seconds <= max_age_seconds,
+                }
+            }
+            None => FeedDataAge {
+                updated_at: 0,
+                age_seconds: 0,
+                max_age_seconds,
+                fresh: false,
+            },
+        }
+    }
+
+    /// Seconds since the pool's most recent observation, or `None` when the
+    /// feed has never been published (Issue #293).
+    pub fn get_feed_age_seconds(env: Env, pool_id: Address) -> Option<u64> {
+        Self::get_apy_registry(env.clone())
+            .get(pool_id)
+            .map(|record| env.ledger().timestamp().saturating_sub(record.updated_at))
+    }
+
+    /// Emit the current data age of a pool's feed as an event, so off-chain
+    /// monitors can record staleness without polling (Issue #293).
+    ///
+    /// Returns the same snapshot the event carries.
+    pub fn emit_feed_data_age(env: Env, pool_id: Address) -> FeedDataAge {
+        let age = Self::get_feed_data_age(env.clone(), pool_id.clone());
+        env.events().publish(
+            (Symbol::new(&env, "feed_data_age"), pool_id),
+            (
+                age.updated_at,
+                age.age_seconds,
+                age.max_age_seconds,
+                age.fresh,
+            ),
+        );
+        age
+    }
+
     /// Replace the set of addresses allowed to push APY observations (admin only).
     /// The admin can always update feeds and does not need to be listed.
     pub fn set_apy_keepers(env: Env, admin: Address, keepers: Vec<Address>) {
@@ -592,6 +712,124 @@ impl RebalanceEngine {
             .instance()
             .get(&Symbol::new(&env, "apy_keepers"))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ============ FEED VALIDATION TRACKING (Issue #289) ============
+
+    /// Number of rejected observations that excludes a pool from routing.
+    pub fn get_feed_failure_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "feed_failure_threshold"))
+            .unwrap_or(DEFAULT_FEED_FAILURE_THRESHOLD)
+    }
+
+    /// Set the number of rejected observations that excludes a pool (admin only).
+    ///
+    /// A threshold of `0` disables exclusion: validation failures are still
+    /// recorded and emitted, but they never remove a pool from routing.
+    pub fn set_feed_failure_threshold(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_failure_threshold"), &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "feed_failure_threshold_updated"),),
+            (admin, threshold),
+        );
+    }
+
+    /// Record that the latest observation for `pool_id` failed validation.
+    ///
+    /// Called by the off-chain validator after it rejects an observation
+    /// (Issue #289). The pool is excluded from routing once the number of
+    /// consecutive failures reaches the configured threshold. Returns the
+    /// updated record.
+    pub fn record_feed_validation_failure(env: Env, pool_id: Address) -> FeedValidationRecord {
+        Self::require_not_paused(&env);
+
+        let mut records = Self::get_feed_validation_map(env.clone());
+        let mut record = records
+            .get(pool_id.clone())
+            .unwrap_or(FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            });
+
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.last_failure_at = env.ledger().timestamp();
+
+        let threshold = Self::get_feed_failure_threshold(env.clone());
+        if threshold > 0 && record.failure_count >= threshold {
+            record.excluded = true;
+        }
+
+        records.set(pool_id.clone(), record.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &records);
+
+        env.events().publish(
+            (Symbol::new(&env, "feed_validation_failed"), pool_id),
+            (record.failure_count, record.excluded),
+        );
+
+        record
+    }
+
+    /// Clear a pool's validation-failure state after a valid observation is
+    /// accepted, re-enabling it for routing. Returns the record it replaced.
+    pub fn record_feed_validation_success(env: Env, pool_id: Address) -> FeedValidationRecord {
+        Self::require_not_paused(&env);
+
+        let mut records = Self::get_feed_validation_map(env.clone());
+        let previous = records
+            .get(pool_id.clone())
+            .unwrap_or(FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            });
+
+        records.set(
+            pool_id.clone(),
+            FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &records);
+
+        env.events()
+            .publish((Symbol::new(&env, "feed_validation_cleared"),), (pool_id,));
+
+        previous
+    }
+
+    /// Validation-failure record for a pool, if any failure has been recorded.
+    pub fn get_feed_validation_record(env: Env, pool_id: Address) -> Option<FeedValidationRecord> {
+        Self::get_feed_validation_map(env).get(pool_id)
+    }
+
+    /// True when the pool's feed is currently excluded from routing (Issue #289).
+    pub fn is_feed_excluded(env: Env, pool_id: Address) -> bool {
+        match Self::get_feed_validation_map(env).get(pool_id) {
+            Some(record) => record.excluded,
+            None => false,
+        }
+    }
+
+    /// Internal: the feed validation map, keyed by pool address.
+    fn get_feed_validation_map(env: Env) -> Map<Address, FeedValidationRecord> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "feed_validation"))
+            .unwrap_or(Map::new(&env))
     }
 
     // ============ REBALANCE PACING (Issue #302) ============
@@ -809,6 +1047,11 @@ impl RebalanceEngine {
         // Each candidate APY is resolved through the oracle first so a stale
         // snapshot in the strategy cannot hide (or invent) an opportunity.
         for mut candidate in strategy.allocations.iter() {
+            // Pools whose feed failed validation are not routing candidates
+            // (Issue #289).
+            if Self::is_feed_excluded(env.clone(), candidate.pool_id.clone()) {
+                continue;
+            }
             let candidate_apy = Self::resolve_apy(env, &candidate.pool_id, candidate.current_apy);
             if candidate.pool_id != current_allocation.pool_id
                 && candidate_apy > current_apy
@@ -981,10 +1224,15 @@ impl RebalanceEngine {
     ) {
         Self::require_admin(&env, admin.clone());
 
+        // Preserve any configured minimum opportunity size (Issue #294); it has
+        // its own setter so this entrypoint's argument list stays unchanged.
+        let min_net_profit = Self::get_arbitrage_thresholds(env.clone()).min_net_profit;
+
         let thresholds = ArbitrageThresholds {
             min_apy_delta,
             max_il_tolerance,
             cooldown_period,
+            min_net_profit,
         };
 
         env.storage()
@@ -1006,7 +1254,34 @@ impl RebalanceEngine {
                 min_apy_delta: 200u32,     // Default 2%
                 max_il_tolerance: 100u32,  // Default 1%
                 cooldown_period: 86400u64, // Default 24 hours
+                min_net_profit: 0i128,     // No minimum opportunity size
             })
+    }
+
+    /// Set the minimum estimated net profit an arbitrage opportunity must reach
+    /// before routing will consider it (admin only, Issue #294).
+    ///
+    /// `min_net_profit` is in the same units as
+    /// [`ArbitrageOpportunity::net_profit`]; `0` disables the filter.
+    pub fn set_min_net_profit(env: Env, admin: Address, min_net_profit: i128) {
+        Self::require_admin(&env, admin.clone());
+        require!(min_net_profit >= 0, "min_net_profit must not be negative");
+
+        let mut thresholds = Self::get_arbitrage_thresholds(env.clone());
+        thresholds.min_net_profit = min_net_profit;
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "arbitrage_thresholds"), &thresholds);
+
+        env.events().publish(
+            (Symbol::new(&env, "min_net_profit_updated"),),
+            (admin, min_net_profit),
+        );
+    }
+
+    /// Minimum estimated net profit required to route an opportunity.
+    pub fn get_min_net_profit(env: Env) -> i128 {
+        Self::get_arbitrage_thresholds(env).min_net_profit
     }
 
     /// Scan available pools and identify arbitrage opportunities
@@ -1028,6 +1303,12 @@ impl RebalanceEngine {
 
         // Scan each available pool
         for pool in available_pools {
+            // A pool whose feed last failed validation must not influence
+            // routing (Issue #289).
+            if Self::is_feed_excluded(env.clone(), pool.pool_id.clone()) {
+                continue;
+            }
+
             // Same for the candidate pool: the registry wins over the snapshot.
             let pool_apy = Self::resolve_apy(&env, &pool.pool_id, pool.current_apy);
             let apy_delta = pool_apy.saturating_sub(vault_apy);
@@ -1039,6 +1320,13 @@ impl RebalanceEngine {
                 // Estimated net profit = APY improvement - IL risk - slippage (simplified)
                 let net_profit_estimate =
                     ((apy_delta as i128 - pool.impermanent_loss_risk as i128) * 1000000) / 10000;
+
+                // Issue #294: drop opportunities too small to be worth
+                // executing. `min_net_profit == 0` disables the filter, so the
+                // default configuration keeps the previous behaviour.
+                if net_profit_estimate < thresholds.min_net_profit {
+                    continue;
+                }
 
                 let opportunity = ArbitrageOpportunity {
                     pool_id: pool.pool_id,
@@ -1150,6 +1438,13 @@ impl RebalanceEngine {
         amount: i128,
     ) -> bool {
         Self::require_not_paused(&env);
+
+        // A pool whose feed last failed validation must not be the destination
+        // of a rebalance, even if a stale opportunity payload still names it
+        // (Issue #289).
+        if Self::is_feed_excluded(env.clone(), opportunity.pool_id.clone()) {
+            return false;
+        }
 
         // Enforce cooldown per vault to prevent churn
         if Self::is_vault_in_cooldown(env.clone(), vault_id.clone()) {
@@ -1383,6 +1678,20 @@ mod tests {
             target_apy: target,
             current_apy: current,
             impermanent_loss_risk: 50,
+        }
+    }
+
+    /// Like [`allocation`], but with an explicit impermanent-loss risk so the
+    /// net-profit filter (Issue #294) can be exercised.
+    fn allocation_with_il(env: &Env, pool: &Address, il_risk: u32) -> PoolAllocation {
+        PoolAllocation {
+            pool_id: pool.clone(),
+            token_a: Address::generate(env),
+            token_b: Address::generate(env),
+            allocation_percent: 5000,
+            target_apy: 1000,
+            current_apy: 1000,
+            impermanent_loss_risk: il_risk,
         }
     }
 
@@ -1837,5 +2146,646 @@ mod tests {
         // needing a token-funded successful rebalance here.
         assert!(!RebalanceEngine::breaker_trips(true, false, false));
         assert!(RebalanceEngine::breaker_trips(false, false, false));
+    }
+
+    // ============ FEED VALIDATION EXCLUSION TESTS (Issue #289) ============
+
+    /// A pool is excluded only once its failures reach the configured threshold,
+    /// and repeated failures keep it excluded.
+    #[test]
+    fn test_feed_validation_failure_excludes_pool_at_threshold() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &3);
+        assert_eq!(client.get_feed_failure_threshold(), 3);
+        assert!(!client.is_feed_excluded(&pool));
+        assert!(client.get_feed_validation_record(&pool).is_none());
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        let first = client.record_feed_validation_failure(&pool);
+        assert_eq!(first.failure_count, 1);
+        assert_eq!(first.last_failure_at, 100);
+        assert!(!first.excluded, "one failure is not enough to exclude");
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        let second = client.record_feed_validation_failure(&pool);
+        assert_eq!(second.failure_count, 2);
+        assert!(!second.excluded);
+
+        env.ledger().with_mut(|li| li.timestamp = 300);
+        let third = client.record_feed_validation_failure(&pool);
+        assert_eq!(third.failure_count, 3);
+        assert!(third.excluded, "threshold reached must exclude the pool");
+        assert!(client.is_feed_excluded(&pool));
+    }
+
+    /// An accepted observation clears the failure state and re-enables routing.
+    #[test]
+    fn test_feed_validation_success_clears_exclusion() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &2);
+        client.record_feed_validation_failure(&pool);
+        client.record_feed_validation_failure(&pool);
+        assert!(client.is_feed_excluded(&pool));
+
+        let replaced = client.record_feed_validation_success(&pool);
+        assert_eq!(replaced.failure_count, 2);
+        assert!(replaced.excluded, "the replaced record is returned");
+
+        assert!(!client.is_feed_excluded(&pool));
+        let record = client.get_feed_validation_record(&pool).unwrap();
+        assert_eq!(record.failure_count, 0);
+        assert!(!record.excluded);
+    }
+
+    /// A threshold of zero records failures but never excludes a pool.
+    #[test]
+    fn test_zero_failure_threshold_disables_exclusion() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &0);
+        for _ in 0..5 {
+            client.record_feed_validation_failure(&pool);
+        }
+
+        let record = client.get_feed_validation_record(&pool).unwrap();
+        assert_eq!(record.failure_count, 5);
+        assert!(!record.excluded);
+        assert!(!client.is_feed_excluded(&pool));
+    }
+
+    /// Failure records are tracked independently per pool.
+    #[test]
+    fn test_feed_validation_records_are_isolated_per_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &2);
+        client.record_feed_validation_failure(&pool_a);
+        client.record_feed_validation_failure(&pool_a);
+
+        assert!(client.is_feed_excluded(&pool_a));
+        assert!(!client.is_feed_excluded(&pool_b));
+        assert!(client.get_feed_validation_record(&pool_b).is_none());
+    }
+
+    /// Setting the exclusion threshold is admin-only.
+    #[test]
+    fn test_set_feed_failure_threshold_is_admin_only() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_feed_failure_threshold(&stranger, &5);
+        }));
+
+        assert!(result.is_err(), "threshold must be admin only");
+    }
+
+    /// An excluded candidate pool is skipped by `scan_opportunities`.
+    #[test]
+    fn test_scan_opportunities_skips_excluded_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let good_pool = Address::generate(&env);
+        let bad_pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &100, &86400);
+        client.set_feed_failure_threshold(&admin, &1);
+
+        let pools = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &good_pool, 5000, 3000, 3000),
+                allocation(&env, &bad_pool, 5000, 3000, 3000),
+            ],
+        );
+
+        // Both candidates clear the thresholds before any failure is recorded.
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            2
+        );
+
+        client.record_feed_validation_failure(&bad_pool);
+
+        let opportunities = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities.get(0).unwrap().pool_id, good_pool);
+    }
+
+    /// An excluded pool is skipped by the rebalance proposal analysis.
+    #[test]
+    fn test_analyze_rebalance_skips_excluded_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        let alloc = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &pool_a, 5000, 900, 1000),
+                allocation(&env, &pool_b, 5000, 900, 1000),
+            ],
+        );
+        let sid = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Exclude"),
+            &2,
+            &100,
+            &500,
+            &3600,
+            &alloc,
+        );
+
+        // B is the better pool: A must move into it.
+        client.update_pool_apy(&admin, &pool_a, &500);
+        client.update_pool_apy(&admin, &pool_b, &1500);
+        let proposals = client.analyze_rebalance_opportunities(&sid);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals.get(0).unwrap().to_pool, pool_b);
+
+        // Once B's feed fails validation it is no longer a routing candidate.
+        client.set_feed_failure_threshold(&admin, &1);
+        client.record_feed_validation_failure(&pool_b);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 0);
+
+        // A valid observation restores it.
+        client.record_feed_validation_success(&pool_b);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 1);
+    }
+
+    /// Execution refuses a destination pool whose feed is excluded, before it
+    /// touches the vault.
+    #[test]
+    fn test_execute_flash_rebalance_rejects_excluded_destination() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let destination = Address::generate(&env);
+        let vault_id = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &1);
+        client.record_feed_validation_failure(&destination);
+        assert!(client.is_feed_excluded(&destination));
+
+        let opportunity = ArbitrageOpportunity {
+            pool_id: destination.clone(),
+            current_apy: 1000,
+            projected_apy: 2500,
+            il_risk: 50,
+            net_profit: 1_000_000,
+            apy_delta: 1500,
+            recommended: true,
+        };
+
+        // `vault_id` is not a deployed vault: the exclusion guard must reject
+        // the call before any vault lookup happens.
+        assert!(!client.execute_flash_rebalance(&admin, &vault_id, &opportunity, &1_000));
+    }
+
+    // ============ NO-CHANGE FEED UPDATE MARKER TESTS (Issue #295) ============
+
+    /// Topic of the only event published by the most recent invocation.
+    ///
+    /// `env.events().all()` only exposes the events of the latest contract
+    /// call, so each event has to be inspected before the next call is made.
+    fn last_event_topic(env: &Env) -> Symbol {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+        let events = env.events().all();
+        let (_contract, topics, _data) = events.last().unwrap();
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap()
+    }
+
+    /// A feed republishing its current value emits the no-change marker.
+    #[test]
+    fn test_unchanged_apy_update_emits_no_change_marker() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "a first publication is a real update"
+        );
+
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged"),
+            "republishing the same value must be identifiable"
+        );
+
+        // Repeating the same value keeps reporting the no-op marker.
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged")
+        );
+    }
+
+    /// The no-change marker carries the caller, value and the timestamp of the
+    /// observation it replaced.
+    #[test]
+    fn test_no_change_marker_payload_records_previous_timestamp() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        env.ledger().set_timestamp(250);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&env, "pool_apy_unchanged"));
+
+        let (by, value, previous_at): (Address, u32, u64) =
+            <(Address, u32, u64)>::try_from_val(&env, &data).unwrap();
+        assert_eq!(by, admin);
+        assert_eq!(value, 900);
+        assert_eq!(previous_at, 100, "the marker reports the replaced stamp");
+    }
+
+    /// A changed value keeps emitting the normal update event.
+    #[test]
+    fn test_changed_apy_update_emits_normal_event() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.update_pool_apy(&admin, &pool, &900);
+        client.update_pool_apy(&admin, &pool, &1500);
+
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "a different value is a genuine update"
+        );
+    }
+
+    /// A no-op update still refreshes freshness and provenance, so a feeder
+    /// that keeps reporting a stable rate is not treated as stale.
+    #[test]
+    fn test_unchanged_update_refreshes_freshness_and_provenance() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        client.set_max_apy_age(&admin, &50);
+        env.ledger().set_timestamp(140);
+        assert!(client.is_apy_fresh(&pool));
+
+        // Past the max age the feed is stale...
+        env.ledger().set_timestamp(200);
+        assert!(!client.is_apy_fresh(&pool));
+
+        // ...and a same-value refresh from a keeper brings it back and stamps
+        // the new provenance.
+        client.set_apy_keepers(&admin, &Vec::from_array(&env, [keeper.clone()]));
+        client.update_pool_apy(&keeper, &pool, &900);
+
+        // Inspect the event before any other call, since `events().all()` only
+        // exposes the latest invocation.
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged")
+        );
+
+        let record = client.get_pool_apy_record(&pool).unwrap();
+        assert_eq!(record.updated_at, 200);
+        assert_eq!(record.updated_by, keeper);
+        assert!(client.is_apy_fresh(&pool));
+    }
+
+    /// A first publication for a pool is never marked as a no-op, even when the
+    /// value happens to be zero.
+    #[test]
+    fn test_first_publication_is_not_marked_unchanged() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        assert!(client.get_pool_apy_record(&pool).is_none());
+        client.update_pool_apy(&admin, &pool, &0);
+
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "there is no previous observation to be unchanged from"
+        );
+    }
+
+    // ============ MINIMUM OPPORTUNITY SIZING TESTS (Issue #294) ============
+
+    /// A pool whose estimated net profit is below the configured minimum is
+    /// dropped from the scan; a larger opportunity in the same scan survives.
+    #[test]
+    fn test_scan_opportunities_filters_below_min_net_profit() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let small_pool = Address::generate(&env);
+        let large_pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+
+        // (apy_delta - il_risk) * 100 = net profit:
+        //   small: (1500 - 900) * 100 = 60_000
+        //   large: (1500 - 100) * 100 = 140_000
+        client.update_pool_apy(&admin, &small_pool, &2500);
+        client.update_pool_apy(&admin, &large_pool, &2500);
+
+        let pools = Vec::from_array(
+            &env,
+            [
+                allocation_with_il(&env, &small_pool, 900),
+                allocation_with_il(&env, &large_pool, 100),
+            ],
+        );
+
+        // Without a minimum both opportunities are returned.
+        assert_eq!(client.get_min_net_profit(), 0);
+        let all = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(all.len(), 2);
+
+        // A minimum between the two drops the trivial one.
+        client.set_min_net_profit(&admin, &100_000);
+        assert_eq!(client.get_min_net_profit(), 100_000);
+
+        let filtered = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get(0).unwrap().pool_id, large_pool);
+        assert_eq!(filtered.get(0).unwrap().net_profit, 140_000);
+
+        // Raising the minimum above every opportunity filters them all out.
+        client.set_min_net_profit(&admin, &500_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+    }
+
+    /// An opportunity exactly at the minimum is kept; the filter is a strict
+    /// lower bound.
+    #[test]
+    fn test_min_net_profit_boundary_is_inclusive() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+        client.update_pool_apy(&admin, &pool, &2500);
+
+        // (1500 - 500) * 100 = 100_000
+        let pools = Vec::from_array(&env, [allocation_with_il(&env, &pool, 500)]);
+
+        client.set_min_net_profit(&admin, &100_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            1
+        );
+
+        client.set_min_net_profit(&admin, &100_001);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+    }
+
+    /// The minimum is disabled by default and a zero value re-disables it.
+    #[test]
+    fn test_min_net_profit_default_and_disable() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+        client.update_pool_apy(&admin, &pool, &2500);
+
+        let pools = Vec::from_array(&env, [allocation_with_il(&env, &pool, 900)]);
+
+        client.set_min_net_profit(&admin, &1_000_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+
+        client.set_min_net_profit(&admin, &0);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            1
+        );
+    }
+
+    /// Updating the other thresholds does not clear the configured minimum.
+    #[test]
+    fn test_set_rebalance_thresholds_preserves_min_net_profit() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+
+        client.set_min_net_profit(&admin, &75_000);
+        client.set_rebalance_thresholds(&admin, &300, &200, &3600);
+
+        let thresholds = client.get_arbitrage_thresholds();
+        assert_eq!(thresholds.min_apy_delta, 300);
+        assert_eq!(thresholds.max_il_tolerance, 200);
+        assert_eq!(thresholds.cooldown_period, 3600);
+        assert_eq!(thresholds.min_net_profit, 75_000);
+    }
+
+    /// Setting the minimum is admin-only and rejects negative values.
+    #[test]
+    fn test_set_min_net_profit_is_admin_only_and_non_negative() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let unauthorized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_min_net_profit(&stranger, &1_000);
+        }));
+        assert!(unauthorized.is_err(), "minimum must be admin only");
+
+        let negative = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_min_net_profit(&admin, &-1);
+        }));
+        assert!(negative.is_err(), "a negative minimum is meaningless");
+
+        assert_eq!(client.get_min_net_profit(), 0);
+    }
+
+    // ============ FEED DATA AGE TESTS (Issue #293) ============
+
+    /// A published feed reports its age and freshness, and the age grows with
+    /// the ledger clock.
+    #[test]
+    fn test_feed_data_age_tracks_age_and_freshness() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        client.update_pool_apy(&admin, &pool, &1200);
+        client.set_max_apy_age(&admin, &500);
+
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 1000);
+        assert_eq!(age.age_seconds, 0);
+        assert_eq!(age.max_age_seconds, 500);
+        assert!(age.fresh);
+
+        env.ledger().set_timestamp(1400);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 1000);
+        assert_eq!(age.age_seconds, 400);
+        assert!(age.fresh, "400s is still within the 500s window");
+
+        // Exactly at the boundary the feed is still fresh (inclusive).
+        env.ledger().set_timestamp(1500);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.age_seconds, 500);
+        assert!(age.fresh);
+
+        // One second later it is stale.
+        env.ledger().set_timestamp(1501);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.age_seconds, 501);
+        assert!(!age.fresh);
+    }
+
+    /// The age snapshot agrees with `is_apy_fresh`.
+    #[test]
+    fn test_feed_data_age_matches_is_apy_fresh() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &100);
+        env.ledger().set_timestamp(10);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        for ts in [10u64, 110, 111, 200] {
+            env.ledger().set_timestamp(ts);
+            assert_eq!(
+                client.get_feed_data_age(&pool).fresh,
+                client.is_apy_fresh(&pool),
+                "snapshot and predicate must agree at t={}",
+                ts
+            );
+        }
+    }
+
+    /// An unpublished feed reports no data rather than appearing brand new.
+    #[test]
+    fn test_feed_data_age_unpublished_is_not_fresh() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &300);
+        env.ledger().set_timestamp(50_000);
+
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 0);
+        assert_eq!(age.age_seconds, 0);
+        assert_eq!(age.max_age_seconds, 300);
+        assert!(!age.fresh, "no observation must never read as fresh");
+        assert!(client.get_feed_age_seconds(&pool).is_none());
+    }
+
+    /// `get_feed_age_seconds` returns `None` before publication and the exact
+    /// age afterwards.
+    #[test]
+    fn test_get_feed_age_seconds() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        assert!(client.get_feed_age_seconds(&pool).is_none());
+
+        env.ledger().set_timestamp(700);
+        client.update_pool_apy(&admin, &pool, &1000);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(0));
+
+        env.ledger().set_timestamp(760);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(60));
+    }
+
+    /// A republished value still resets the age.
+    #[test]
+    fn test_republished_feed_resets_age() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+        env.ledger().set_timestamp(500);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(400));
+
+        client.update_pool_apy(&admin, &pool, &900);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(0));
+        assert!(client.get_feed_data_age(&pool).fresh);
+    }
+
+    /// `emit_feed_data_age` publishes the snapshot and returns it unchanged.
+    #[test]
+    fn test_emit_feed_data_age_publishes_snapshot() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &600);
+        env.ledger().set_timestamp(2_000);
+        client.update_pool_apy(&admin, &pool, &1500);
+
+        env.ledger().set_timestamp(2_250);
+        let returned = client.emit_feed_data_age(&pool);
+
+        assert_eq!(returned.updated_at, 2_000);
+        assert_eq!(returned.age_seconds, 250);
+        assert_eq!(returned.max_age_seconds, 600);
+        assert!(returned.fresh);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&env, "feed_data_age"));
+
+        let (updated_at, age_seconds, max_age_seconds, fresh): (u64, u64, u64, bool) =
+            <(u64, u64, u64, bool)>::try_from_val(&env, &data).unwrap();
+        assert_eq!(updated_at, 2_000);
+        assert_eq!(age_seconds, 250);
+        assert_eq!(max_age_seconds, 600);
+        assert!(fresh);
     }
 }

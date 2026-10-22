@@ -9,6 +9,23 @@
  * addresses it cares about; events from every other address are silently
  * discarded before reaching registered handlers.
  *
+ * ## Surviving an outage
+ *
+ * A keeper that keeps its cursor in memory alone loses its place whenever the
+ * process dies: after a crash or a deploy it either replays the whole
+ * history or starts from scratch.  Passing a {@link CheckpointStore} makes the
+ * position durable — the listener restores the cursor from the checkpoint
+ * before its first poll and writes a fresh checkpoint after every poll, so a
+ * restart during an outage resumes at exactly the ledger it left off.
+ *
+ * ```ts
+ * const listener = new ContractEventListener(rpcServer, {
+ *   contractAddresses: [VAULT_A, VAULT_B],
+ *   startLedger: 0,
+ *   store: new FileCheckpointStore('./state/keeper.json'),
+ * });
+ * ```
+ *
  * ## Usage
  *
  * ```ts
@@ -27,6 +44,20 @@
  */
 
 import type { VaultEvent, RebalanceEvent, RewardEvent } from './types';
+import {
+  createCheckpoint,
+  type CheckpointStore,
+  type KeeperCheckpoint,
+} from './persistence';
+
+/**
+ * Default number of events requested per poll.
+ *
+ * Kept well below Soroban's 10 000 ceiling so a single poll stays cheap, but
+ * high enough that a keeper catching up after an outage needs only a handful
+ * of polls to drain the backlog.
+ */
+export const DEFAULT_PAGE_SIZE = 200;
 
 // ---------------------------------------------------------------------------
 // Soroban RPC surface
@@ -162,6 +193,10 @@ export interface ListenerConfig {
    * Ledger sequence to start reading from. The listener advances its internal
    * cursor forward as ledgers are consumed so restarts do not re-process old
    * events.
+   *
+   * When a {@link ListenerConfig.store} is configured this is only a
+   * fallback: the restored checkpoint takes precedence unless it points
+   * further back than `startLedger`.
    */
   startLedger: number;
 
@@ -177,6 +212,42 @@ export interface ListenerConfig {
    * `contractAddresses` — do **not** set both; use `contractAddresses`.
    */
   rpcFilter?: Omit<GetEventsFilter, 'contractIds'>;
+
+  /**
+   * Durable store for the listener's position.
+   *
+   * When set, the listener restores its cursor from the store before the
+   * first poll and writes a fresh checkpoint after every successful poll. A
+   * restart after an outage then resumes at the ledger it left off instead of
+   * replaying (or skipping) history.
+   */
+  store?: CheckpointStore;
+
+  /**
+   * Restore the cursor from {@link ListenerConfig.store} automatically before
+   * the first poll. Defaults to `true` whenever a store is configured.
+   *
+   * The restore happens on the first poll no matter how the listener is
+   * driven — `start()`, a manual `poll()`, or a script — so there is no way
+   * to accidentally poll from the wrong position after a restart.
+   */
+  autoRestore?: boolean;
+
+  /**
+   * Write a checkpoint after every successful poll. Defaults to `true` when a
+   * store is configured. Disable only when the caller persists the position
+   * itself.
+   */
+  persistOnPoll?: boolean;
+
+  /**
+   * Extra counters stored alongside the position in the checkpoint. Useful
+   * for operators that want to inspect how much work a keeper has done.
+   */
+  checkpointMetadata?: Record<string, string | number | boolean>;
+
+  /** Clock, injectable for tests. Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +292,14 @@ export interface ListenerErrorEvent {
  * Poll errors are delivered through the `error` handler if one is registered.
  * If no error handler is registered, errors are logged to `console.error` and
  * the poll loop continues. The listener never stops itself on error.
+ *
+ * ### Durable state
+ *
+ * When a {@link CheckpointStore} is configured the listener restores its
+ * cursor before the first poll and writes a checkpoint after every successful
+ * poll. A restart after an outage therefore resumes at the ledger the keeper
+ * left off — catching up on everything that happened while it was down
+ * without replaying what it had already handled.
  */
 export class ContractEventListener {
   private readonly source: EventSource;
@@ -231,6 +310,21 @@ export class ContractEventListener {
 
   /** Latest ledger the listener has consumed (exclusive lower bound). */
   private cursor: number;
+
+  /** Durable store for the listener's position (optional). */
+  private readonly store?: CheckpointStore;
+
+  /** Clock used to stamp checkpoints. */
+  private readonly now: () => number;
+
+  /** The checkpoint restored on start, if any. */
+  private restoredCheckpoint: KeeperCheckpoint | null = null;
+
+  /** Whether the durable position was already restored for this process. */
+  private restoreAttempted = false;
+
+  /** Ledger the listener resumed from after a restore. */
+  private resumedFromLedger: number | null = null;
 
   /** Typed-event handler registry. */
   private readonly handlers = new Map<KnownEventName, Set<EventHandler<KnownEventName>>>();
@@ -288,6 +382,8 @@ export class ContractEventListener {
     this.source = source;
     this.config = config;
     this.cursor = config.startLedger;
+    this.store = config.store;
+    this.now = config.now ?? Date.now;
 
     // Normalise addresses once for O(1) look-ups at event time.
     this.allowedAddresses = new Set(
@@ -353,13 +449,21 @@ export class ContractEventListener {
   /**
    * Start polling the Soroban RPC at the given interval.
    *
+   * When a {@link CheckpointStore} is configured the cursor is restored from
+   * it *before* the first poll, so a restarted keeper continues from the
+   * ledger it left off instead of starting over. A checkpoint that cannot be
+   * read is reported through the `error` handler and the listener falls back
+   * to the configured `startLedger`.
+   *
    * @param intervalMs Milliseconds between polls (default: 5000 ms / 1 ledger).
    */
   start(intervalMs = 5_000): void {
     if (this.intervalHandle !== null) return; // already running
-    // Poll immediately on start, then on the interval.
-    void this.poll();
     this.intervalHandle = setInterval(() => void this.poll(), intervalMs);
+    // Poll immediately on start (the first poll restores the durable
+    // position first); it runs in the background so `start()` stays
+    // synchronous.
+    void this.poll();
   }
 
   /** Stop polling. In-flight polls complete normally. */
@@ -380,6 +484,83 @@ export class ContractEventListener {
     return this.cursor;
   }
 
+  /** The highest ledger the listener has fully consumed (`-1` when none). */
+  get lastProcessedLedger(): number {
+    return this.cursor - 1;
+  }
+
+  // -------------------------------------------------------------------------
+  // Durable state
+  // -------------------------------------------------------------------------
+
+  /**
+   * Restore the cursor from the configured store.
+   *
+   * The checkpoint wins over the configured `startLedger` unless the operator
+   * moved `startLedger` further ahead, in which case the listener honours the
+   * newer position. Returns `true` when a checkpoint was applied.
+   *
+   * The first poll restores automatically (unless
+   * {@link ListenerConfig.autoRestore} is `false`), so calling this by hand
+   * is only needed when the caller wants to inspect the restored position
+   * before the first poll.
+   *
+   * @throws {CheckpointError} when the store holds an unreadable checkpoint.
+   *   Callers that prefer a best-effort restart should catch the error and
+   *   continue from the configured `startLedger`.
+   */
+  async restore(): Promise<boolean> {
+    this.restoreAttempted = true;
+    if (!this.store) return false;
+
+    const checkpoint = await this.store.load();
+    if (!checkpoint) return false;
+
+    this.cursor = Math.max(this.config.startLedger, checkpoint.nextLedger);
+    this.restoredCheckpoint = checkpoint;
+    this.resumedFromLedger = this.cursor;
+    return true;
+  }
+
+  /**
+   * Write the listener's current position to the configured store.
+   *
+   * @returns The checkpoint that was written, or `null` when no store is
+   *   configured.
+   */
+  async persist(): Promise<KeeperCheckpoint | null> {
+    if (!this.store) return null;
+
+    const checkpoint = createCheckpoint(
+      this.cursor,
+      this.now(),
+      this.config.checkpointMetadata,
+    );
+    await this.store.save(checkpoint);
+    return checkpoint;
+  }
+
+  /**
+   * The checkpoint that was restored on start, or `null` when the listener
+   * started without durable state (or the store was empty).
+   */
+  get restoredState(): KeeperCheckpoint | null {
+    return this.restoredCheckpoint;
+  }
+
+  /**
+   * The ledger the listener resumed from after a restore, or `null` when no
+   * checkpoint was restored.
+   */
+  get resumeLedger(): number | null {
+    return this.resumedFromLedger;
+  }
+
+  /** Whether durable state is configured for this listener. */
+  get isPersistent(): boolean {
+    return this.store !== undefined;
+  }
+
   // -------------------------------------------------------------------------
   // Core polling logic
   // -------------------------------------------------------------------------
@@ -388,28 +569,87 @@ export class ContractEventListener {
    * Perform a single poll against the RPC and dispatch resulting events.
    *
    * This is public so it can be called manually in tests or scripts that
-   * manage their own timing.
+   * manage their own timing. Polls never overlap: a call made while another
+   * poll is in flight waits for it to finish.
    */
-  async poll(): Promise<void> {
-    try {
-      const request = this.buildRequest();
-      const response = await this.source.getEvents(request);
-      this.processResponse(response);
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      const event: ListenerErrorEvent = { error, ledger: this.cursor };
-      if (this.errorHandlers.size > 0) {
-        this.errorHandlers.forEach((h) => h(event));
-      } else {
-        // eslint-disable-next-line no-console
-        console.error(`[ContractEventListener] poll error at ledger ${this.cursor}:`, error.message);
-      }
-    }
+  poll(): Promise<void> {
+    // Chain onto the previous poll. Both arms run the next poll so a rejection
+    // can never stall the loop permanently.
+    this.pollChain = this.pollChain.then(
+      () => this.runPoll(),
+      () => this.runPoll(),
+    );
+    return this.pollChain;
   }
 
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
+
+  /**
+   * Run a single poll: restore the durable position (first poll only),
+   * fetch, dispatch and persist.
+   */
+  private async runPoll(): Promise<void> {
+    try {
+      await this.restoreIfNeeded();
+      const request = this.buildRequest();
+      const response = await this.source.getEvents(request);
+      this.processResponse(response);
+      await this.persistIfEnabled();
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.emitError(error);
+    }
+  }
+
+  /**
+   * Restore the durable position before the very first poll.
+   *
+   * A checkpoint that cannot be read is reported through the error handler and
+   * the listener falls back to the configured `startLedger` — a keeper that
+   * cannot read its state still comes back up and says so.
+   */
+  private async restoreIfNeeded(): Promise<void> {
+    if (!this.store) return;
+    if (this.restoreAttempted) return;
+    if (this.config.autoRestore === false) return;
+
+    try {
+      await this.restore();
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.emitError(error);
+    }
+  }
+
+  private async persistIfEnabled(): Promise<void> {
+    if (!this.store) return;
+    if (this.config.persistOnPoll === false) return;
+
+    try {
+      await this.persist();
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.emitError(error);
+    }
+  }
+
+  private emitError(error: Error): void {
+    const event: ListenerErrorEvent = { error, ledger: this.cursor };
+    if (this.errorHandlers.size > 0) {
+      this.errorHandlers.forEach((h) => {
+        try {
+          h(event);
+        } catch {
+          // A broken error handler must not take the keeper down.
+        }
+      });
+    } else {
+      // eslint-disable-next-line no-console
+      console.error(`[ContractEventListener] poll error at ledger ${this.cursor}:`, error.message);
+    }
+  }
 
   private buildRequest(): GetEventsRequest {
     const filter: GetEventsFilter = {
@@ -425,12 +665,15 @@ export class ContractEventListener {
     return {
       startLedger: this.cursor,
       filters: [filter],
-      limit: this.config.pageSize ?? 200,
+      limit: this.config.pageSize ?? DEFAULT_PAGE_SIZE,
     };
   }
 
   private processResponse(response: GetEventsResponse): void {
     const { events, latestLedger } = response;
+
+    // Highest ledger covered by an event we actually consumed.
+    let highestEventLedger = -1;
 
     for (const raw of events) {
       // SDK-level guard: drop events not in the allow-list.
@@ -458,13 +701,51 @@ export class ContractEventListener {
       } else {
         this.logSkipped('unknown_topic', raw, null);
       }
+
+      if (raw.ledger > highestEventLedger) {
+        highestEventLedger = raw.ledger;
+      }
     }
 
-    // Advance the cursor past the latest ledger so the next poll does not
-    // re-fetch the same events.  We only advance when the RPC reports a
-    // later ledger than our current cursor.
-    if (latestLedger > this.cursor) {
-      this.cursor = latestLedger + 1;
+    this.advanceCursor(events.length, highestEventLedger, latestLedger);
+  }
+
+  /**
+   * Move the cursor forward to the first ledger that has not been consumed.
+   *
+   * Two cases matter:
+   *
+   * - **Drained** (`events.length < limit`): the RPC had nothing left to
+   *   return, so everything up to the node's head has been consumed and the
+   *   cursor jumps to `latestLedger + 1`.
+   * - **Truncated** (`events.length === limit`): the page was full, so more
+   *   events may still be waiting. The cursor therefore only advances to the
+   *   ledger after the highest event actually consumed. Jumping to the head
+   *   here would silently skip the events that did not fit on the page —
+   *   exactly the events a keeper misses when it comes back from a long
+   *   outage.
+   *
+   * The cursor never moves backwards.
+   */
+  private advanceCursor(
+    eventCount: number,
+    highestEventLedger: number,
+    latestLedger: number,
+  ): void {
+    const limit = this.config.pageSize ?? DEFAULT_PAGE_SIZE;
+    const drained = eventCount < limit;
+
+    // When the page was full we only know about the events we consumed; when
+    // it was not, the node's head is the authoritative end of the range.
+    const consumedThrough = drained
+      ? Math.max(highestEventLedger, latestLedger)
+      : highestEventLedger;
+
+    if (consumedThrough < 0) return;
+
+    const next = consumedThrough + 1;
+    if (next > this.cursor) {
+      this.cursor = next;
     }
   }
 

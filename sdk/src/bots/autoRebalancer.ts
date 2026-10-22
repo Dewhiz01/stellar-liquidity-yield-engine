@@ -6,8 +6,19 @@ import {
   RoundTripCostEstimator,
 } from '../arbitrage';
 import { LedgerHeadSource, RpcLagMonitor, RpcLagOptions, RpcLagReport } from '../rpcSync';
+import {
+  createStateCheckpoint,
+  type CheckpointStore,
+  type KeeperCheckpoint,
+} from '../persistence';
 import { SorobanRpc } from 'stellar-sdk';
 import axios from 'axios';
+
+/** Metadata key holding the wall-clock time of the last successful rebalance. */
+export const STATE_KEY_LAST_EXECUTION_TIME = 'lastExecutionTimeMs';
+
+/** Metadata key holding the last cron minute that was consumed. */
+export const STATE_KEY_LAST_CONSUMED_MINUTE = 'lastConsumedMinute';
 
 export interface RebalancerConfig {
   vaultAddress: string;
@@ -32,6 +43,23 @@ export interface RebalancerConfig {
   rpcHeadSource?: LedgerHeadSource;
   /** Thresholds for the RPC lag warning. */
   lagOptions?: RpcLagOptions;
+  /**
+   * Durable store for the keeper's own state (last execution time and the
+   * last consumed cron minute).
+   *
+   * Without it a restart forgets that a rebalance already happened, and the
+   * keeper would happily execute a second one as soon as it comes back up.
+   * With it the keeper resumes exactly where it left off.
+   */
+  stateStore?: CheckpointStore;
+}
+
+/** The keeper state that has to survive a restart. */
+export interface RebalancerState {
+  /** Wall-clock time of the last successful rebalance (0 when none). */
+  lastExecutionTime: number;
+  /** The last cron minute that was consumed (-1 when none). */
+  lastConsumedMinute: number;
 }
 
 export interface RebalanceResult {
@@ -123,6 +151,71 @@ export class AutoRebalancer {
   }
 
   /**
+   * The keeper state that has to survive a restart.
+   */
+  getState(): RebalancerState {
+    return {
+      lastExecutionTime: this.lastExecutionTime,
+      lastConsumedMinute: this.lastConsumedMinute,
+    };
+  }
+
+  /**
+   * Restore the keeper's state from the configured store.
+   *
+   * Called automatically at the start of the first {@link run}. Returns `true`
+   * when a checkpoint was applied.
+   *
+   * @throws When the stored checkpoint cannot be read. The keeper fails closed
+   *   in that case: without knowing when it last executed it must not execute
+   *   again.
+   */
+  async restoreState(): Promise<boolean> {
+    const store = this.config.stateStore;
+    if (!store) {
+      this.stateRestored = true;
+      return false;
+    }
+
+    // Load first: if this throws, the keeper stays un-restored so the next
+    // run retries (and fails closed again) instead of proceeding on defaults.
+    const checkpoint = await store.load();
+    this.stateRestored = true;
+    if (!checkpoint) return false;
+
+    const metadata = checkpoint.metadata ?? {};
+    const lastExecutionTime = metadata[STATE_KEY_LAST_EXECUTION_TIME];
+    if (typeof lastExecutionTime === 'number' && Number.isFinite(lastExecutionTime)) {
+      this.lastExecutionTime = lastExecutionTime;
+    }
+
+    const lastConsumedMinute = metadata[STATE_KEY_LAST_CONSUMED_MINUTE];
+    if (typeof lastConsumedMinute === 'number' && Number.isInteger(lastConsumedMinute)) {
+      this.lastConsumedMinute = lastConsumedMinute;
+    }
+
+    return true;
+  }
+
+  /**
+   * Write the keeper's current state to the configured store.
+   *
+   * @returns The checkpoint that was written, or `null` when no store is
+   *   configured.
+   */
+  async persistState(): Promise<KeeperCheckpoint | null> {
+    const store = this.config.stateStore;
+    if (!store) return null;
+
+    const checkpoint = createStateCheckpoint(Date.now(), {
+      [STATE_KEY_LAST_EXECUTION_TIME]: this.lastExecutionTime,
+      [STATE_KEY_LAST_CONSUMED_MINUTE]: this.lastConsumedMinute,
+    });
+    await store.save(checkpoint);
+    return checkpoint;
+  }
+
+  /**
    * Check the RPC node's ledger head against the last ledger this keeper has
    * processed, warning when the node is noticeably behind. Returns `undefined`
    * when no head source is configured.
@@ -180,6 +273,14 @@ export class AutoRebalancer {
     const results: RebalanceResult[] = [];
 
     try {
+      // Recover the keeper's state from the last run before acting. A keeper
+      // that comes back from an outage must not repeat the rebalance it
+      // already executed, so an unreadable checkpoint fails the run closed
+      // instead of silently forgetting the cooldown.
+      if (!this.stateRestored) {
+        await this.restoreState();
+      }
+
       // Warn before acting if the RPC node's head has fallen noticeably behind
       // the last ledger this keeper processed.
       const lag = await this.checkRpcLag();
@@ -208,6 +309,11 @@ export class AutoRebalancer {
         });
         return results;
       }
+
+      // The scheduled slot has been consumed — record it before doing any
+      // work, so a restart in the middle of this run does not open the same
+      // slot a second time.
+      await this.persistState();
 
       // Scan for opportunities
       const opportunities = await this.scanner.findOpportunities(
@@ -342,6 +448,10 @@ export class AutoRebalancer {
         };
         results.push(result);
         this.executionHistory.push(result);
+
+        // Make the new position durable before anything else can fail, so a
+        // restart right after this point does not repeat the rebalance.
+        await this.persistState();
 
         // Send notifications
         await this.notifyExecution(result);
